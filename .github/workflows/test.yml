@@ -1,0 +1,16 @@
+name: macOS checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Zsh syntax, whitespace lint, and tests
+        run: zsh tests/test_envc.zsh

@@ -1,0 +1,503 @@
+#!/usr/bin/env zsh
+
+emulate -L zsh
+setopt err_exit no_unset pipe_fail
+
+readonly ENVC_VERSION=0.1.0
+
+typeset -g ENVC_ROOT ENVC_SCRIPT target_app target_profile target_slug target_path
+typeset -ga resolved_paths resolved_slugs
+
+ENVC_ROOT=${ENVC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}
+[[ $ENVC_ROOT == /* ]] || ENVC_ROOT="$PWD/$ENVC_ROOT"
+ENVC_ROOT=${ENVC_ROOT:A}
+ENVC_SCRIPT=${0:A}
+
+fail() {
+  print -u2 -r -- "envc: $*"
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: envc [--version|-V] <command> [arguments]
+
+Commands:
+  --version, -V             Show the version
+  edit <target>              Create or edit one profile in a safe editor
+  run <target>... -- <cmd>   Run a command with layered profiles
+  env <target>...            Print shell-escaped exports
+  path [-e|--exists] <target>...
+                             Print resolved profile paths
+  cat|show <target>...       Print one or more profile files
+  list|ls [filter]           List profiles, optionally filtering by substring
+  delete|rm <target>         Delete a profile
+  completions                Print Zsh completion code
+  help                       Show this help
+
+Targets are <app> or <app>/<profile>; <app> selects default.env.
+A trailing .env on a profile is optional. Profile files are trusted Zsh code.
+EOF
+}
+
+resolve_target() {
+  local target=$1 app profile
+
+  if [[ $target == */* ]]; then
+    app=${target%%/*}
+    profile=${target#*/}
+    [[ $profile != */* ]] || fail "invalid target '$target': expected at most one slash"
+  else
+    app=$target
+    profile=default
+  fi
+
+  [[ $app =~ '^[A-Za-z0-9._-]+$' ]] || fail "invalid target '$target': invalid app segment"
+  [[ $profile =~ '^[A-Za-z0-9._-]+$' ]] || fail "invalid target '$target': invalid profile segment"
+  [[ $app != . && $app != .. && $profile != . && $profile != .. ]] ||
+    fail "invalid target '$target': '.' and '..' are not allowed"
+
+  if [[ $profile == *.env ]]; then
+    profile=${profile%.env}
+  fi
+  [[ -n $profile && $profile != . && $profile != .. ]] ||
+    fail "invalid target '$target': profile name is empty or reserved"
+
+  target_app=$app
+  target_profile=$profile
+  target_slug="$app/$profile"
+  target_path="$ENVC_ROOT/$app/$profile.env"
+  [[ ! -L "$ENVC_ROOT/$app" ]] || fail "refusing symlinked app directory for '$target_slug'"
+}
+
+resolve_targets() {
+  (( $# > 0 )) || fail "at least one target is required"
+  resolved_paths=()
+  resolved_slugs=()
+  local target
+  for target in "$@"; do
+    resolve_target "$target"
+    resolved_paths+=("$target_path")
+    resolved_slugs+=("$target_slug")
+  done
+}
+
+validate_profile_entry() {
+  local path=$1 slug=$2
+  [[ ! -L $path ]] || fail "refusing symlinked profile '$slug'"
+  [[ -f $path ]] || fail "profile '$slug' is missing or not a regular file"
+}
+
+validate_profile_file() {
+  local path=$1 slug=$2
+  validate_profile_entry "$path" "$slug"
+  [[ -r $path ]] || fail "profile '$slug' is unreadable"
+}
+
+cmd_edit() {
+  (( $# == 1 )) || fail "edit requires exactly one target"
+  resolve_target "$1"
+
+  local editor_spec=${ENVC_EDITOR:-vi}
+  [[ -n $editor_spec ]] || editor_spec=vi
+  [[ $editor_spec != *[\'\"\`\;\|\&\(\)\<\>\$\{\}\[\]\*?!]* ]] ||
+    fail "ENVC_EDITOR must be a plain terminal editor command without shell syntax"
+
+  local editor_command=${editor_spec%%[[:space:]]*}
+  local editor_base=${editor_command:t}
+  local editor_lower=${(L)editor_base}
+  case $editor_lower in
+    code|code-*|codium|cursor|windsurf|zed|subl|sublime*|idea*|pycharm*|webstorm*|goland*|clion*|fleet*|open)
+      fail "editor '$editor_base' is blocked; choose a terminal editor"
+      ;;
+  esac
+
+  local -a editor_args
+  case $editor_lower in
+    vi|vim|nvim|nano|helix|hx|micro|true)
+      [[ $editor_spec == $editor_command ]] ||
+        fail "arguments are not supported for editor '$editor_base'"
+      editor_args=("$editor_command")
+      ;;
+    emacs)
+      [[ $editor_spec == "$editor_command -nw" ]] ||
+        fail "emacs must be configured with the -nw terminal option"
+      editor_args=("$editor_command" -nw)
+      ;;
+    *)
+      fail "unsupported editor '$editor_base'; use vi, vim, nvim, nano, helix, hx, micro, or emacs -nw"
+      ;;
+  esac
+  if [[ $editor_command == */* ]]; then
+    [[ -x $editor_command ]] || fail "editor executable is not executable: '$editor_command'"
+  else
+    command -v "$editor_command" >/dev/null 2>&1 ||
+      fail "editor executable not found: '$editor_command'"
+  fi
+
+  local app_dir="$ENVC_ROOT/$target_app"
+  if [[ -e $app_dir && ! -d $app_dir ]]; then
+    fail "app path is not a directory for '$target_slug'"
+  fi
+  /bin/mkdir -p "$app_dir" || fail "could not create app directory for '$target_slug'"
+  [[ ! -L $app_dir ]] || fail "refusing symlinked app directory for '$target_slug'"
+  /bin/chmod 700 "$app_dir" || fail "could not secure app directory for '$target_slug'"
+
+  if [[ ! -e $target_path && ! -L $target_path ]]; then
+    if (umask 077; setopt noclobber; print -r -- \
+      "# envc config: $target_slug"$'\n'"# Store non-secret environment variables here. Use 'kch' for secrets." > "$target_path"); then
+      :
+    else
+      fail "could not create profile '$target_slug'"
+    fi
+  fi
+  [[ ! -L $target_path && -f $target_path ]] ||
+    fail "profile '$target_slug' is not a regular file"
+  /bin/chmod 600 "$target_path" || fail "could not secure profile '$target_slug'"
+  validate_profile_file "$target_path" "$target_slug"
+
+  local editor_status=0
+  "${editor_args[@]}" "$target_path" || editor_status=$?
+  [[ ! -L $target_path && -f $target_path ]] ||
+    fail "editor replaced profile '$target_slug' with an unsafe file"
+  /bin/chmod 600 "$target_path" || fail "could not secure profile '$target_slug' after editing"
+  validate_profile_file "$target_path" "$target_slug"
+  (( editor_status == 0 )) || fail "editor exited with status $editor_status"
+
+  lint_profile "$target_path" "$target_slug"
+}
+
+lint_profile() {
+  local path=$1 slug=$2 line key
+  local -a suspects
+  local -A seen
+  suspects=()
+  seen=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ '^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*(SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE_KEY|API_KEY|CLIENT_SECRET|SIGNING_KEY)[A-Za-z0-9_]*)=([^[:space:]#]+)' ]] ||
+      continue
+    key=${match[2]}
+    [[ $line =~ '[[:space:]]# envc:allow[[:space:]]*$' ]] && continue
+    if (( ! ${+seen[$key]} )); then
+      suspects+=("$key")
+      seen[$key]=1
+    fi
+  done < "$path"
+
+  if (( $#suspects > 0 )); then
+    print -u2 -r -- "envc: warning: possible secret variable(s) found in $slug:"
+    for key in "${suspects[@]}"; do
+      print -u2 -r -- "  - $key"
+    done
+    print -u2 -r -- "Consider removing them from this file and storing them in Keychain with: kch add <NAME>"
+  fi
+}
+
+cmd_path() {
+  local exists=0
+  if [[ ${1-} == -e || ${1-} == --exists ]]; then
+    exists=1
+    shift
+  fi
+  resolve_targets "$@"
+  local i
+  if (( exists )); then
+    for (( i = 1; i <= $#resolved_paths; i++ )); do
+      [[ ! -L ${resolved_paths[i]} && -f ${resolved_paths[i]} ]] ||
+        fail "profile '${resolved_slugs[i]}' does not exist as a regular file"
+    done
+  fi
+  for (( i = 1; i <= $#resolved_paths; i++ )); do
+    print -r -- "${resolved_paths[i]}"
+  done
+}
+
+cmd_cat() {
+  resolve_targets "$@"
+  local i
+  for (( i = 1; i <= $#resolved_paths; i++ )); do
+    validate_profile_file "${resolved_paths[i]}" "${resolved_slugs[i]}"
+  done
+  if (( $#resolved_paths > 1 )); then
+    for (( i = 1; i <= $#resolved_paths; i++ )); do
+      print -r -- "# --- ${resolved_slugs[i]} (${resolved_paths[i]}) ---"
+      /bin/cat "${resolved_paths[i]}" || fail "could not read profile '${resolved_slugs[i]}'"
+    done
+  else
+    /bin/cat "${resolved_paths[1]}" || fail "could not read profile '${resolved_slugs[1]}'"
+  fi
+}
+
+cmd_list() {
+  (( $# <= 1 )) || fail "list accepts at most one filter"
+  local filter=${1-}
+  local file app profile slug
+  local -a slugs
+  slugs=()
+  for file in "$ENVC_ROOT"/*/*.env(N); do
+    [[ -f $file && ! -L $file && ! -L ${file:h} ]] || continue
+    app=${file:h:t}
+    profile=${file:t}
+    profile=${profile%.env}
+    [[ $app =~ '^[A-Za-z0-9._-]+$' && $profile =~ '^[A-Za-z0-9._-]+$' ]] || continue
+    [[ $app != . && $app != .. && $profile != . && $profile != .. ]] || continue
+    slug="$app/$profile"
+    if [[ -n $filter ]]; then
+      [[ ${(L)slug} == *${(b)${(L)filter}}* ]] || continue
+    fi
+    slugs+=("$slug")
+  done
+  slugs=("${(@o)slugs}")
+  for slug in "${slugs[@]}"; do
+    print -r -- "$slug"
+  done
+}
+
+cmd_delete() {
+  (( $# == 1 )) || fail "delete requires exactly one target"
+  resolve_target "$1"
+  validate_profile_entry "$target_path" "$target_slug"
+  /bin/rm -f "$target_path" || fail "could not delete profile '$target_slug'"
+  /bin/rmdir "$ENVC_ROOT/$target_app" 2>/dev/null || true
+}
+
+cmd_run() {
+  local -a targets command_args
+  targets=()
+  while (( $# > 0 )) && [[ $1 != -- ]]; do
+    targets+=("$1")
+    shift
+  done
+  (( $# > 0 )) || fail "run requires '--' before the command"
+  shift
+  (( $# > 0 )) || fail "run requires a command after '--'"
+  resolve_targets "${targets[@]}"
+  local i
+  for (( i = 1; i <= $#resolved_paths; i++ )); do
+    validate_profile_file "${resolved_paths[i]}" "${resolved_slugs[i]}"
+  done
+  command_args=("$@")
+  command zsh -f "$ENVC_SCRIPT" __run "${resolved_paths[@]}" -- "${command_args[@]}"
+}
+
+cmd_env() {
+  resolve_targets "$@"
+  local i tmp result_status
+  for (( i = 1; i <= $#resolved_paths; i++ )); do
+    validate_profile_file "${resolved_paths[i]}" "${resolved_slugs[i]}"
+  done
+  tmp=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/envc.XXXXXXXX") ||
+    fail "could not create temporary output file"
+  if /usr/bin/env -i HOME="$HOME" USER="${USER:-}" PATH="$PATH" ENVC_CONFIG_DIR="$ENVC_ROOT" \
+    zsh -f "$ENVC_SCRIPT" __env "${resolved_paths[@]}" > "$tmp"; then
+    /bin/cat "$tmp" || {
+      result_status=$?
+      /bin/rm -f "$tmp"
+      fail "could not write environment output (status $result_status)"
+    }
+    /bin/rm -f "$tmp" || fail "could not remove temporary output file"
+  else
+    result_status=$?
+    /bin/rm -f "$tmp" || fail "could not remove temporary output file"
+    exit "$result_status"
+  fi
+}
+
+validate_internal_files() {
+  (( $# > 0 )) || fail "at least one profile is required"
+  local path relative app profile_file target
+  for path in "$@"; do
+    [[ $path == "$ENVC_ROOT/"* ]] ||
+      fail "internal profile path is outside the configuration root"
+    relative=${path#"$ENVC_ROOT/"}
+    [[ $relative != */*/* && $relative == */*.env ]] ||
+      fail "invalid internal profile path"
+    app=${relative%%/*}
+    profile_file=${relative#*/}
+    target="$app/${profile_file%.env}"
+    resolve_target "$target"
+    [[ $target_path == "$path" ]] || fail "internal profile path is not canonical"
+    validate_profile_file "$path" "$target_slug"
+  done
+}
+
+internal_run() {
+  local -a __envc_files __envc_command_args
+  __envc_files=()
+  while (( $# > 0 )) && [[ $1 != -- ]]; do
+    __envc_files+=("$1")
+    shift
+  done
+  (( $# > 0 )) || fail "internal run delimiter missing"
+  shift
+  (( $# > 0 )) || fail "internal run command missing"
+  __envc_command_args=("$@")
+  validate_internal_files "${__envc_files[@]}"
+  setopt allexport
+  local __envc_file
+  for __envc_file in "${__envc_files[@]}"; do
+    . "$__envc_file" >/dev/null || fail "could not source profile"
+    setopt allexport
+  done
+  unsetopt allexport
+  exec "${__envc_command_args[@]}"
+}
+
+internal_env() {
+  local -a __envc_files __envc_tracked __envc_candidates
+  local -A __envc_baseline_values __envc_baseline_present
+  __envc_files=("$@")
+  __envc_tracked=()
+  __envc_candidates=()
+  __envc_baseline_values=()
+  __envc_baseline_present=()
+  local __envc_name __envc_file __envc_line __envc_value __envc_quoted
+
+  validate_internal_files "${__envc_files[@]}"
+  unset ENVC_CONFIG_DIR
+
+  for __envc_name in ${(k)parameters}; do
+    if [[ ${parameters[$__envc_name]-} == *export* ]]; then
+      __envc_baseline_present[$__envc_name]=1
+      __envc_baseline_values[$__envc_name]="${(P)__envc_name}"
+    fi
+  done
+
+  for __envc_file in "${__envc_files[@]}"; do
+    while IFS= read -r __envc_line || [[ -n $__envc_line ]]; do
+      if [[ $__envc_line =~ '^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=' ]]; then
+        __envc_tracked+=("${match[2]}")
+      fi
+    done < "$__envc_file"
+  done
+
+  setopt allexport
+  for __envc_file in "${__envc_files[@]}"; do
+    . "$__envc_file" >/dev/null || fail "could not source profile"
+    setopt allexport
+  done
+  unsetopt allexport
+
+  for __envc_name in ${(k)parameters}; do
+    if [[ ${parameters[$__envc_name]-} == *export* ]]; then
+      if (( ! ${+__envc_baseline_present[$__envc_name]} )) ||
+        [[ ${(P)__envc_name} != ${__envc_baseline_values[$__envc_name]} ]]; then
+        __envc_candidates+=("$__envc_name")
+      fi
+    fi
+  done
+  __envc_candidates+=("${__envc_tracked[@]}")
+  __envc_candidates=("${(@o)${(@u)__envc_candidates}}")
+
+  for __envc_name in "${__envc_candidates[@]}"; do
+    if [[ ${parameters[$__envc_name]-} == scalar-export ]]; then
+      __envc_value=${(P)__envc_name}
+      __envc_quoted=${__envc_value//\'/\'\\\'\'}
+      print -r -- "export $__envc_name='$__envc_quoted'"
+    fi
+  done
+}
+
+completion_code() {
+  cat <<'EOF'
+#compdef envc
+
+_envc_targets() {
+  local -a profiles
+  profiles=("${(@f)$(command envc list)}")
+  compadd -- "${profiles[@]}"
+}
+
+_envc() {
+  local command_name
+  local -a commands
+  commands=(--version -V edit run env path cat show list ls delete rm completions help)
+  if (( CURRENT == 2 )); then
+    compadd -- "${commands[@]}"
+    return
+  fi
+  command_name=${words[2]}
+  case $command_name in
+    edit|delete|rm)
+      _envc_targets
+      ;;
+    run)
+      if (( ${words[(Ie)--]} )); then
+        _normal
+      else
+        _envc_targets
+      fi
+      ;;
+    path)
+      if (( CURRENT == 3 )) && [[ ${words[CURRENT]} == -* ]]; then
+        compadd -- -e --exists
+      fi
+      _envc_targets
+      ;;
+    env|cat|show)
+      _envc_targets
+      ;;
+    list|ls)
+      return
+      ;;
+  esac
+}
+
+compdef _envc envc
+EOF
+}
+
+main() {
+  (( $# > 0 )) || {
+    usage >&2
+    return 1
+  }
+  local command_name=$1
+  shift
+  case $command_name in
+    --version|-V)
+      (( $# == 0 )) || fail "$command_name takes no other arguments"
+      print -r -- "envc $ENVC_VERSION"
+      ;;
+    help|-h|--help)
+      (( $# == 0 )) || fail "help takes no arguments"
+      usage
+      ;;
+    edit)
+      cmd_edit "$@"
+      ;;
+    run)
+      cmd_run "$@"
+      ;;
+    env)
+      cmd_env "$@"
+      ;;
+    path)
+      cmd_path "$@"
+      ;;
+    cat|show)
+      cmd_cat "$@"
+      ;;
+    list|ls)
+      cmd_list "$@"
+      ;;
+    delete|rm)
+      cmd_delete "$@"
+      ;;
+    completions)
+      (( $# == 0 )) || fail "completions takes no arguments"
+      completion_code
+      ;;
+    __run)
+      internal_run "$@"
+      ;;
+    __env)
+      internal_env "$@"
+      ;;
+    *)
+      fail "unknown command '$command_name'; run 'envc help' for usage"
+      ;;
+  esac
+}
+
+main "$@"
