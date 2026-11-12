@@ -282,23 +282,15 @@ cmd_run() {
 
 cmd_env() {
   resolve_targets "$@"
-  local i tmp result_status
+  local i exports result_status
   for (( i = 1; i <= $#resolved_paths; i++ )); do
     validate_profile_file "${resolved_paths[i]}" "${resolved_slugs[i]}"
   done
-  tmp=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/envc.XXXXXXXX") ||
-    fail "could not create temporary output file"
-  if /usr/bin/env -i HOME="$HOME" USER="${USER:-}" PATH="$PATH" ENVC_CONFIG_DIR="$ENVC_ROOT" \
-    zsh -f "$ENVC_SCRIPT" __env "${resolved_paths[@]}" > "$tmp"; then
-    /bin/cat "$tmp" || {
-      result_status=$?
-      /bin/rm -f "$tmp"
-      fail "could not write environment output (status $result_status)"
-    }
-    /bin/rm -f "$tmp" || fail "could not remove temporary output file"
+  if exports=$(/usr/bin/env -i HOME="$HOME" USER="${USER:-}" PATH="$PATH" ENVC_CONFIG_DIR="$ENVC_ROOT" \
+    zsh -f "$ENVC_SCRIPT" __env "${resolved_paths[@]}"); then
+    print -r -- "$exports"
   else
     result_status=$?
-    /bin/rm -f "$tmp" || fail "could not remove temporary output file"
     exit "$result_status"
   fi
 }
